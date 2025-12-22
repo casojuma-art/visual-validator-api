@@ -1,0 +1,136 @@
+import torch
+from transformers import CLIPProcessor, CLIPModel
+from PIL import Image
+import io
+import os
+import re
+import html
+import logging
+from fastapi import FastAPI, HTTPException, Security, Depends, File, UploadFile, Form
+from fastapi.security.api_key import APIKeyHeader
+
+# --- CONFIGURACIÓN DE LOGS ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="SeeStocks Visual Validator API")
+
+# --- RUTAS Y CONFIGURACIÓN ---
+KEYS_PATH = "/app/api_keys.txt"
+MODEL_NAME = "openai/clip-vit-base-patch32"
+# Detectar si hay tarjeta gráfica (NVIDIA) o usamos el procesador
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# --- SEGURIDAD: API KEY (Igual a tu otro servicio) ---
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def get_api_key(api_key_header: str = Security(api_key_header)):
+    if not os.path.exists(KEYS_PATH):
+        logger.warning("Fichero api_keys.txt no encontrado.")
+        valid_keys = set()
+    else:
+        with open(KEYS_PATH, "r") as f:
+            valid_keys = {line.strip() for line in f if line.strip()}
+
+    if api_key_header in valid_keys:
+        return api_key_header
+    else:
+        raise HTTPException(
+            status_code=401, 
+            detail="Credenciales inválidas (X-API-Key required)"
+        )
+
+# --- SEGURIDAD: SANITIZACIÓN (Igual a tu otro servicio) ---
+def sanitize_input(text: str) -> str:
+    if not text: return ""
+    if len(text) > 500: text = text[:500]
+    text = text.replace("\0", "").replace("\\", "")
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'<[^>]*>', '', text)
+    return html.escape(text).strip()
+
+# --- VARIABLES GLOBALES PARA LA IA ---
+model = None
+processor = None
+
+def load_visual_model():
+    global model, processor
+    try:
+        logger.info(f">>> Cargando CLIP en {DEVICE}... espera un momento.")
+        # Descargamos el cerebro de la IA
+        model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE)
+        processor = CLIPProcessor.from_pretrained(MODEL_NAME)
+        logger.info(">>> MODELO VISUAL LISTO PARA TRABAJAR.")
+    except Exception as e:
+        logger.error(f"!!! Error cargando el modelo: {str(e)}")
+
+@app.on_event("startup")
+async def startup_event():
+    load_visual_model()
+
+# --- ENDPOINT PRINCIPAL ---
+
+@app.post("/verify")
+async def verify(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    category: str = Form(...),
+    token: str = Depends(get_api_key)
+):
+    if model is None:
+        raise HTTPException(status_code=503, detail="El modelo no está listo.")
+
+    try:
+        # 1. Limpiar los textos que nos envían
+        safe_title = sanitize_input(title)
+        safe_category = sanitize_input(category)
+
+        # 2. Leer la imagen que sube el usuario
+        img_bytes = await file.read()
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        # 3. Preparar las "etiquetas" contra las que comparamos
+        # Las dos primeras son lo que BUSCAMOS. Las otras son lo que queremos RECHAZAR.
+        labels = [
+            f"a photo of {safe_category}", 
+            f"a photo of {safe_title}",
+            "a photo with watermarks, logos or text on top",
+            "a generic placeholder image or 'image not found' sign",
+            "a blurry or low quality photo"
+        ]
+
+        # 4. Inferencia (La IA analiza la imagen frente a los textos)
+        inputs = processor(text=labels, images=image, return_tensors="pt", padding=True).to(DEVICE)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        
+        # Convertimos los resultados a porcentajes (0 a 1)
+        probs = outputs.logits_per_image.softmax(dim=1)[0].tolist()
+
+        # 5. Lógica de decisión
+        score_match = max(probs[0], probs[1]) # Qué tanto se parece a la categoría/título
+        score_bad = max(probs[2], probs[3], probs[4]) # Qué tanto se parece a basura/marcas agua
+
+        # Decidimos si la imagen es válida
+        is_valid = score_match > 0.40 and score_bad < 0.35
+
+        return {
+            "is_valid": is_valid,
+            "confidence": round(score_match * 100, 2),
+            "detections": {
+                "category_match": round(probs[0], 4),
+                "product_match": round(probs[1], 4),
+                "watermark_text": round(probs[2], 4),
+                "placeholder_or_error": round(probs[3], 4),
+                "low_quality": round(probs[4], 4)
+            },
+            "status": "success"
+        }
+
+    except Exception as e:
+        logger.error(f"Error procesando: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error interno analizando la imagen")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "engine": "clip-visual"}
