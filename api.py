@@ -6,6 +6,7 @@ import os
 import re
 import html
 import logging
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Security, Depends, File, UploadFile, Form
 from fastapi.security.api_key import APIKeyHeader
 
@@ -13,12 +14,19 @@ from fastapi.security.api_key import APIKeyHeader
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="SeeStocks Visual Validator API")
+app = FastAPI(title="SeeStocks Visual Validator & Suggester")
 
 # --- RUTAS Y CONFIGURACIÓN ---
 KEYS_PATH = "/app/api_keys.txt"
+CSV_PATH = "gpc_id_to_path.csv" 
 MODEL_NAME = "openai/clip-vit-base-patch32"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# --- VARIABLES GLOBALES ---
+model = None
+processor = None
+taxonomy_names = []
+taxonomy_embeddings = None
 
 # --- SEGURIDAD: API KEY ---
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -34,12 +42,8 @@ def get_api_key(api_key_header: str = Security(api_key_header)):
     if api_key_header in valid_keys:
         return api_key_header
     else:
-        raise HTTPException(
-            status_code=401, 
-            detail="Credenciales inválidas (X-API-Key required)"
-        )
+        raise HTTPException(status_code=401, detail="Credenciales inválidas (X-API-Key required)")
 
-# --- SEGURIDAD: SANITIZACIÓN ---
 def sanitize_input(text: str) -> str:
     if not text: return ""
     if len(text) > 500: text = text[:500]
@@ -48,23 +52,42 @@ def sanitize_input(text: str) -> str:
     text = re.sub(r'<[^>]*>', '', text)
     return html.escape(text).strip()
 
-# --- VARIABLES GLOBALES PARA LA IA ---
-model = None
-processor = None
-
-def load_visual_model():
-    global model, processor
+# --- CARGA DE MODELO Y TAXONOMÍA ---
+def load_assets():
+    global model, processor, taxonomy_names, taxonomy_embeddings
     try:
         logger.info(f">>> Cargando CLIP en {DEVICE}...")
         model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE)
         processor = CLIPProcessor.from_pretrained(MODEL_NAME)
-        logger.info(">>> MODELO VISUAL LISTO.")
+
+        if os.path.exists(CSV_PATH):
+            logger.info(f">>> Cargando taxonomía desde {CSV_PATH}...")
+            df = pd.read_csv(CSV_PATH)
+            # Asumimos que la columna 1 tiene la ruta de categoría
+            taxonomy_names = df.iloc[:, 1].astype(str).tolist()
+            
+            all_embeddings = []
+            batch_size = 128
+            with torch.no_grad():
+                for i in range(0, len(taxonomy_names), batch_size):
+                    batch = taxonomy_names[i:i+batch_size]
+                    clean_batch = [f"a photo of {t.replace(' > ', ' ')}" for t in batch]
+                    inputs = processor(text=clean_batch, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+                    text_features = model.get_text_features(**inputs)
+                    text_features /= text_features.norm(dim=-1, keepdim=True)
+                    all_embeddings.append(text_features)
+            
+            taxonomy_embeddings = torch.cat(all_embeddings)
+            logger.info(f">>> {len(taxonomy_names)} categorías indexadas.")
+        else:
+            logger.error(f"!!! No se encontró {CSV_PATH}. La sugerencia no funcionará.")
+
     except Exception as e:
-        logger.error(f"!!! Error cargando el modelo: {str(e)}")
+        logger.error(f"!!! Error en carga inicial: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
-    load_visual_model()
+    load_assets()
 
 # --- ENDPOINT PRINCIPAL ---
 
@@ -82,20 +105,18 @@ async def verify(
         safe_title = sanitize_input(title)
         safe_category = sanitize_input(category)
 
-        # 1. Leer imagen y gestionar transparencias (FONDO BLANCO)
+        # 1. Gestionar imagen y transparencias
         img_bytes = await file.read()
         image = Image.open(io.BytesIO(img_bytes))
 
         if image.mode in ("RGBA", "P"):
             image = image.convert("RGBA")
-            # Creamos un fondo blanco sólido
             background = Image.new("RGBA", image.size, (255, 255, 255, 255))
-            # Combinamos la imagen sobre el fondo blanco
             image = Image.alpha_composite(background, image).convert("RGB")
         else:
             image = image.convert("RGB")
 
-        # 2. Etiquetas de comparación
+        # 2. Inferencia para Validación
         labels = [
             f"a photo of {safe_category}", 
             f"a photo of {safe_title}",
@@ -104,23 +125,31 @@ async def verify(
             "a blurry or low quality photo"
         ]
 
-        # 3. Inferencia
         inputs = processor(text=labels, images=image, return_tensors="pt", padding=True).to(DEVICE)
         with torch.no_grad():
             outputs = model(**inputs)
+            # Extraer características visuales para la sugerencia
+            image_features = model.get_image_features(pixel_values=inputs['pixel_values'])
+            image_features /= image_features.norm(dim=-1, keepdim=True)
         
         probs = outputs.logits_per_image.softmax(dim=1)[0].tolist()
 
-        # 4. Lógica de decisión mejorada
+        # 3. Lógica de decisión original
         score_match = max(probs[0], probs[1]) 
         score_bad = max(probs[2], probs[3], probs[4])
-
-        # Bajamos el umbral a 0.35 para ser más flexibles con joyería fina
         is_valid = score_match > 0.15 and score_bad < 0.7
+
+        # 4. Lógica de sugerencia (Taxonomía Google)
+        suggested_cat = "N/A"
+        if taxonomy_embeddings is not None:
+            similarities = (image_features @ taxonomy_embeddings.T).squeeze(0)
+            best_idx = similarities.argmax().item()
+            suggested_cat = taxonomy_names[best_idx]
 
         return {
             "is_valid": is_valid,
             "confidence": round(score_match * 100, 2),
+            "image_suggest_category": suggested_cat, # <--- Nuevo campo
             "detections": {
                 "category_match": round(probs[0], 4),
                 "product_match": round(probs[1], 4),
@@ -137,4 +166,4 @@ async def verify(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "clip-visual"}
+    return {"status": "ok", "engine": "clip-visual-with-taxonomy"}

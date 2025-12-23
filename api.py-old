@@ -18,10 +18,9 @@ app = FastAPI(title="SeeStocks Visual Validator API")
 # --- RUTAS Y CONFIGURACIÓN ---
 KEYS_PATH = "/app/api_keys.txt"
 MODEL_NAME = "openai/clip-vit-base-patch32"
-# Detectar si hay tarjeta gráfica (NVIDIA) o usamos el procesador
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# --- SEGURIDAD: API KEY (Igual a tu otro servicio) ---
+# --- SEGURIDAD: API KEY ---
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def get_api_key(api_key_header: str = Security(api_key_header)):
@@ -40,7 +39,7 @@ def get_api_key(api_key_header: str = Security(api_key_header)):
             detail="Credenciales inválidas (X-API-Key required)"
         )
 
-# --- SEGURIDAD: SANITIZACIÓN (Igual a tu otro servicio) ---
+# --- SEGURIDAD: SANITIZACIÓN ---
 def sanitize_input(text: str) -> str:
     if not text: return ""
     if len(text) > 500: text = text[:500]
@@ -56,11 +55,10 @@ processor = None
 def load_visual_model():
     global model, processor
     try:
-        logger.info(f">>> Cargando CLIP en {DEVICE}... espera un momento.")
-        # Descargamos el cerebro de la IA
+        logger.info(f">>> Cargando CLIP en {DEVICE}...")
         model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE)
         processor = CLIPProcessor.from_pretrained(MODEL_NAME)
-        logger.info(">>> MODELO VISUAL LISTO PARA TRABAJAR.")
+        logger.info(">>> MODELO VISUAL LISTO.")
     except Exception as e:
         logger.error(f"!!! Error cargando el modelo: {str(e)}")
 
@@ -81,16 +79,23 @@ async def verify(
         raise HTTPException(status_code=503, detail="El modelo no está listo.")
 
     try:
-        # 1. Limpiar los textos que nos envían
         safe_title = sanitize_input(title)
         safe_category = sanitize_input(category)
 
-        # 2. Leer la imagen que sube el usuario
+        # 1. Leer imagen y gestionar transparencias (FONDO BLANCO)
         img_bytes = await file.read()
-        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        image = Image.open(io.BytesIO(img_bytes))
 
-        # 3. Preparar las "etiquetas" contra las que comparamos
-        # Las dos primeras son lo que BUSCAMOS. Las otras son lo que queremos RECHAZAR.
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGBA")
+            # Creamos un fondo blanco sólido
+            background = Image.new("RGBA", image.size, (255, 255, 255, 255))
+            # Combinamos la imagen sobre el fondo blanco
+            image = Image.alpha_composite(background, image).convert("RGB")
+        else:
+            image = image.convert("RGB")
+
+        # 2. Etiquetas de comparación
         labels = [
             f"a photo of {safe_category}", 
             f"a photo of {safe_title}",
@@ -99,20 +104,19 @@ async def verify(
             "a blurry or low quality photo"
         ]
 
-        # 4. Inferencia (La IA analiza la imagen frente a los textos)
+        # 3. Inferencia
         inputs = processor(text=labels, images=image, return_tensors="pt", padding=True).to(DEVICE)
         with torch.no_grad():
             outputs = model(**inputs)
         
-        # Convertimos los resultados a porcentajes (0 a 1)
         probs = outputs.logits_per_image.softmax(dim=1)[0].tolist()
 
-        # 5. Lógica de decisión
-        score_match = max(probs[0], probs[1]) # Qué tanto se parece a la categoría/título
-        score_bad = max(probs[2], probs[3], probs[4]) # Qué tanto se parece a basura/marcas agua
+        # 4. Lógica de decisión mejorada
+        score_match = max(probs[0], probs[1]) 
+        score_bad = max(probs[2], probs[3], probs[4])
 
-        # Decidimos si la imagen es válida
-        is_valid = score_match > 0.40 and score_bad < 0.35
+        # Bajamos el umbral a 0.35 para ser más flexibles con joyería fina
+        is_valid = score_match > 0.15 and score_bad < 0.7
 
         return {
             "is_valid": is_valid,

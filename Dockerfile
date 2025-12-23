@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api.py .
 COPY api_keys.txt .
+COPY gpc_id_to_path.csv .
 
 EXPOSE 8000
 
