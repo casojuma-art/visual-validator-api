@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.csv
+!gpc_id_to_path.csv
