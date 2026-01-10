@@ -26,7 +26,9 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # --- CONFIGURACIÓN DE UMBRAL (EL "FILTRO DE IGNORANCIA") ---
 # 0.22 es un valor conservador para CLIP ViT-B/32. 
 # Si la similitud es menor, es ruido o confusión geométrica.
-TAXONOMY_THRESHOLD = 0.28 
+TAXONOMY_THRESHOLD = 0.28
+VALIDATION_MATCH_THRESHOLD = 0.22 # Subimos de 0.15 a 0.22 (exigimos más parecido al producto)
+MAX_BAD_SCORE_ALLOWED = 0.60     # Bajamos de 0.70 a 0.50 (toleramos menos logos/basura)
 
 # --- VARIABLES GLOBALES ---
 model = None
@@ -144,7 +146,8 @@ async def verify(
         # 3. Lógica de validación (¿Es la imagen válida?)
         score_match = max(probs[0], probs[1]) 
         score_bad = max(probs[2], probs[3], probs[4])
-        is_valid = score_match > 0.15 and score_bad < 0.7
+        #is_valid = score_match > 0.15 and score_bad < 0.7
+        is_valid = score_match > VALIDATION_MATCH_THRESHOLD and score_bad < MAX_BAD_SCORE_ALLOWED
 
         # 4. Lógica de sugerencia (Taxonomía Google) CON UMBRAL V2
         suggested_cat = None
